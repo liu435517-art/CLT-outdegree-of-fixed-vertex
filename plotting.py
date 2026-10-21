@@ -16,19 +16,24 @@ import reportlab
 from reportlab.graphics import renderSVG
 from reportlab.graphics.charts.lineplots import LinePlot
 from reportlab.graphics.shapes import Drawing, Line, Rect, String
+from reportlab.graphics.widgets.markers import makeMarker
 from reportlab.lib.colors import HexColor
 
 from simulation import constants
 
-COLORS = ['#176B9D', '#E48A28', '#238A68', '#B44C66', '#8263AB', '#67788A']
+COLORS = ['#176B9D', '#E48A28', '#238A68', '#B44C66', '#8263AB',
+          '#67788A', '#A37600', '#007F86', '#884E2F', '#5954BD']
 NORMAL = NormalDist()
 
 
 def chart(path, title, curves, xlabel, ylabel, ylim=None):
     """curves = [(legend, [(x,y), ...]), ...]。"""
-    drawing = Drawing(850, 460)
-    drawing.add(Rect(0, 0, 850, 460, fillColor=HexColor('#FFFFFF'), strokeColor=None))
-    drawing.add(String(65, 435, title, fontName='Helvetica-Bold', fontSize=16,
+    # 图例在绘图区上方；随曲线数量自动加高，十个 u 也不会压住曲线。
+    legend_rows = max(1, math.ceil(len(curves)/3))
+    height = 440 + 20*legend_rows
+    drawing = Drawing(850, height)
+    drawing.add(Rect(0, 0, 850, height, fillColor=HexColor('#FFFFFF'), strokeColor=None))
+    drawing.add(String(65, height-28, title, fontName='Helvetica-Bold', fontSize=16,
                        fillColor=HexColor('#16334A')))
     plot = LinePlot()
     plot.x, plot.y, plot.width, plot.height = 75, 75, 690, 280
@@ -42,19 +47,36 @@ def chart(path, title, curves, xlabel, ylabel, ylim=None):
     plot.yValueAxis.maximumTicks = 7
     plot.yValueAxis.visibleGrid = 1
     plot.yValueAxis.gridStrokeColor = HexColor('#E4EAF0')
+    all_x = [x for _, points in curves for x, _ in points]
+    if all_x and min(all_x) == max(all_x):
+        plot.xValueAxis.valueMin = all_x[0]-0.5
+        plot.xValueAxis.valueMax = all_x[0]+0.5
     if ylim is not None:
         plot.yValueAxis.valueMin, plot.yValueAxis.valueMax = ylim
-    for i, (label, _) in enumerate(curves):
-        color = HexColor(COLORS[i % len(COLORS)])
+    data_index = 0
+    dash_patterns = [None, [6, 3], [2, 3], [8, 3, 2, 3]]
+    for i, (label, points) in enumerate(curves):
+        reference = label.startswith(('Reference', 'Limit', 'Asymptotic', 'Standard normal'))
+        if reference:
+            color, dash = HexColor('#202B33'), [6, 3]
+        else:
+            color = HexColor(COLORS[data_index % len(COLORS)])
+            dash = dash_patterns[(data_index // len(COLORS)) % len(dash_patterns)]
+            data_index += 1
         plot.lines[i].strokeColor = color
         plot.lines[i].strokeWidth = 1.7
-        lx, ly = 75 + (i % 3)*250, 403 - (i // 3)*20
-        drawing.add(Line(lx, ly, lx+22, ly, strokeColor=color, strokeWidth=2))
+        if dash:
+            plot.lines[i].strokeDashArray = dash
+        if len(points) == 1 or len(set(points)) == 1:
+            plot.lines[i].symbol = makeMarker('FilledCircle', size=5, fillColor=color, strokeColor=color)
+        lx, ly = 75 + (i % 3)*250, height-60 - (i // 3)*20
+        drawing.add(Line(lx, ly, lx+22, ly, strokeColor=color, strokeWidth=2, strokeDashArray=dash))
         drawing.add(String(lx+29, ly-3, label, fontSize=10))
     drawing.add(plot)
     drawing.add(String(420, 27, xlabel, textAnchor='middle', fontSize=11))
     drawing.add(String(75, 365, ylabel, fontSize=10))
     renderSVG.drawToFile(drawing, str(path))
+    return drawing
 
 
 def empirical_cdf(z, xmin, xmax):
@@ -68,6 +90,84 @@ def empirical_cdf(z, xmin, xmax):
     return points
 
 
+def build_comparison_curves(samples, vertices, model, summary_rows):
+    """同一模型中一条曲线对应一个 u；各 u 分别使用自己的理论标准化常数。"""
+    m = samples['m']
+    x = np.log10(m)
+    curves = {key: [] for key in ['mean', 'mean_ratio', 'variance_ratio', 'w1', 'cdf', 'qq']}
+    if model == 'gauss':
+        curves['paths'] = []
+    w1 = {(int(row['u']), int(row['m'])): float(row['empirical_w1_to_normal'])
+          for row in summary_rows if row['model'] == model}
+    standardized = {}
+    for u in vertices:
+        d = samples[f'{model}_u{u}']
+        _, alpha, var_c = constants(u)
+        label = f'u={u}'
+        mean, variance = d.mean(axis=1), d.var(axis=1, ddof=1)
+        curves['mean'].append((label, list(zip(x, mean))))
+        curves['mean_ratio'].append((label, list(zip(x, mean/(alpha*np.sqrt(m))))))
+        curves['variance_ratio'].append((label, list(zip(x, variance/(var_c*np.sqrt(m))))))
+        curves['w1'].append((label, [(float(t), w1[u, int(n)]) for t, n in zip(x, m)]))
+        if model == 'gauss':
+            curves['paths'].append((label, list(zip(x, d[:, 0]/(alpha*np.sqrt(m))))))
+        z = (d[-1]-alpha*math.sqrt(int(m[-1]))) / math.sqrt(var_c*math.sqrt(int(m[-1])))
+        standardized[u] = z
+        probabilities = (np.arange(len(z))+0.5)/len(z)
+        normal_q = [NORMAL.inv_cdf(float(p)) for p in probabilities]
+        curves['qq'].append((label, list(zip(normal_q, np.sort(z)))))
+    for key in ['mean_ratio', 'variance_ratio', 'paths']:
+        if key in curves:
+            curves[key].append(('Reference = 1', [(float(x[0]), 1), (float(x[-1]), 1)]))
+    low = min(-4.0, *(float(z.min()) for z in standardized.values()))
+    high = max(4.0, *(float(z.max()) for z in standardized.values()))
+    for u, z in standardized.items():
+        curves['cdf'].append((f'u={u}', empirical_cdf(z, low, high)))
+    curves['cdf'].append(('Standard normal', [(float(t), NORMAL.cdf(float(t)))
+                                            for t in np.linspace(low, high, 250)]))
+    qlow = min(points[0][0] for _, points in curves['qq'])
+    qhigh = max(points[-1][0] for _, points in curves['qq'])
+    curves['qq'].append(('Reference y = x', [(qlow, qlow), (qhigh, qhigh)]))
+    return curves
+
+
+def comparison_report(samples, vertices, rows, figures):
+    parts = ['<h2>所有 u 同图对比</h2>',
+             '<p>每条彩色曲线代表一个 u，相同 u 在各汇总图中使用相同颜色。'
+             '超过十个 u 后，颜色与线型组合区分曲线；黑色虚线是理论参考线。'
+             '真实模型和代理模型分开作图。</p>']
+    specs = [
+        ('mean', 'Mean outdegree', 'log10(m)', 'Empirical mean of D_m',
+         '不同 u 的平均出度，纵轴保留原始尺度。'),
+        ('mean_ratio', 'Normalized mean', 'log10(m)', 'Mean / (alpha_u * sqrt(m))',
+         '每个 u 的均值分别除以自己的渐近主项，参考值为 1。'),
+        ('variance_ratio', 'Normalized variance', 'log10(m)', 'Variance / (sigma_u^2 * sqrt(m))',
+         '每个 u 的样本方差分别除以自己的渐近主项，参考值为 1。'),
+        ('paths', 'Nested prefixes: first path', 'log10(m)', 'D_m / (alpha_u * sqrt(m))',
+         '同一条模拟轨道上不同 u 的出度；各 m 保留轨道前缀关系。此图只显示第一条轨道，不是样本均值。'),
+        ('w1', 'Empirical normal W1', 'log10(m)', 'Empirical W1 distance',
+         '各 u 的标准化经验分布到标准正态的 W1 距离，包含有限轨道数的抽样误差。'),
+        ('cdf', 'CLT empirical CDF', 'Standardized outdegree Z', 'Cumulative probability',
+         '在最大 m 处比较各 u 的经验分布。每个 u 使用自己的理论中心和尺度。'),
+        ('qq', 'Normal Q-Q', 'Theoretical standard normal quantile', 'Observed standardized quantile',
+         '在最大 m 处比较各 u 的正态 Q-Q 曲线，黑色虚线是 y=x。'),
+    ]
+    for model, name in [('gauss', 'Gauss'), ('poisson_proxy', 'Poisson proxy')]:
+        if f'{model}_u{vertices[0]}' not in samples:
+            continue
+        curves = build_comparison_curves(samples, vertices, model, rows)
+        parts.append(f'<h3>{name}：{len(vertices)} 个 u</h3>')
+        for key, title, xlabel, ylabel, caption in specs:
+            if key not in curves:
+                continue
+            filename = f'compare_{model}_{key}.svg'
+            suffix = f' | m={int(samples["m"][-1]):,}' if key in ('cdf', 'qq') else ''
+            chart(figures/filename, f'{name} | {title}{suffix}', curves[key], xlabel, ylabel,
+                  (0, 1) if key == 'cdf' else None)
+            parts.append(f'<figure><img src="figures/{filename}"><figcaption>{caption}</figcaption></figure>')
+    return parts
+
+
 def make_report(output):
     output = Path(output)
     metadata = json.loads((output/'metadata.json').read_text(encoding='utf-8'))
@@ -79,6 +179,8 @@ def make_report(output):
     with np.load(output/'samples.npz') as samples:
         m = samples['m']
         x = np.log10(m)
+        content.extend(comparison_report(samples, metadata['vertices'], rows, figures))
+        content.append('<h2>各 u 的详细结果</h2><p>下面保留逐个 u 的真实模型与代理模型对照。</p>')
         for u in metadata['vertices']:
             _, alpha, var_c = constants(u)
             real = samples[f'gauss_u{u}']
@@ -142,6 +244,7 @@ img{width:100%;height:auto}figcaption{padding:0 30px 15px;color:#42566b}table{bo
 td,th{border-bottom:1px solid #dde5ed;padding:8px;text-align:right}th:first-child,td:first-child{text-align:left}
 .note{background:#e8f0f8;padding:18px;border-radius:10px}code{background:#e3eaf1;padding:2px 5px}
 </style><h1>连分数图固定顶点出度：数值实验</h1>'''
+    document += f'<p>共 {len(metadata["vertices"])} 个 u：{metadata["vertices"]}。</p>'
     document += f'<p>独立轨道数：{metadata["repetitions"]}；随机种子：{metadata["seed"]}；转移次数：{metadata["checkpoints"]}。</p>'
     document += '''<div class="note">本实验以用户提供的讲稿为理论目标，采用平稳 Gauss 条件抽样生成有依赖的数字。
 实验用于检查数值表现，不构成对定理或证明的认证。代理模型是独立 Poisson 计数的占盒数，不是 Poisson 出度。

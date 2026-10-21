@@ -7,12 +7,15 @@ from __future__ import annotations
 
 import argparse
 import csv
+from datetime import datetime
 import hashlib
 import json
 import math
 from pathlib import Path
 import platform
+import re
 from statistics import NormalDist
+import sys
 import time
 
 import numpy as np
@@ -176,24 +179,98 @@ def summarize(data, model, checkpoints):
     return rows
 
 
-def main():
+def parse_positive_values(text):
+    """读取正整数列表或闭区间，支持空格、逗号以及 1-10，去重后排序。"""
+    text = re.sub(r'\s*[-–—]\s*', '-', text.strip())
+    values = set()
+    for token in re.split(r'[,，;；\s]+', text):
+        match = re.fullmatch(r'([0-9]+)(?:-([0-9]+))?', token)
+        if match is None:
+            raise ValueError('请输入正整数，例如 1 3 5，或连续范围 1-10。')
+        first = int(match[1])
+        last = int(match[2]) if match[2] else first
+        if first < 1 or last < first:
+            raise ValueError('数值必须为正整数，范围终点不能小于起点。')
+        if last-first+1 > 10000 or len(values) > 10000:
+            raise ValueError('一次输入的数值过多，请缩小范围（最多 10000 个）。')
+        values.update(range(first, last+1))
+    if len(values) > 10000:
+        raise ValueError('一次最多输入 10000 个不同数值。')
+    return sorted(values)
+
+
+def prompt_value(label, default, convert):
+    while True:
+        text = input(f'{label} [回车使用 {default}]：').strip()
+        try:
+            return convert(text or str(default))
+        except ValueError as error:
+            print(f'输入有误：{error}', flush=True)
+
+
+def parse_repetitions(text):
+    value = int(text)
+    if value < 2:
+        raise ValueError('独立轨道数至少为 2。')
+    return value
+
+
+def new_output_directory():
+    root = Path(__file__).resolve().parent / 'results'
+    name = datetime.now().strftime('run-%Y%m%d-%H%M%S-%f')
+    candidate = root / name
+    index = 1
+    while candidate.exists():
+        candidate = root / f'{name}-{index}'
+        index += 1
+    return candidate
+
+
+def parse_options(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--u', nargs='+', type=int, default=[1, 2, 5], help='fixed vertices')
     parser.add_argument('--m', nargs='+', type=int, default=[100, 300, 1000, 3000, 10000, 30000],
                         help='numbers of transitions, not numbers of digits')
     parser.add_argument('--repetitions', type=int, default=1000)
     parser.add_argument('--seed', type=int, default=20261021)
-    parser.add_argument('--output', type=Path, default=Path('results/demo'))
+    parser.add_argument('--output', type=Path, default=None,
+                        help='output directory; default: a new timestamped directory under results/')
     parser.add_argument('--skip-proxy', action='store_true')
     parser.add_argument('--no-plots', action='store_true')
-    args = parser.parse_args()
-    vertices, checkpoints = sorted(set(args.u)), sorted(set(args.m))
-    if min(vertices + checkpoints) < 1 or args.repetitions < 2 or args.seed < 0:
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--interactive', action='store_true', help='prompt for u, m and repetitions')
+    mode.add_argument('--no-interactive', action='store_true', help='run defaults without prompts')
+    args = parser.parse_args(argv)
+    if args.interactive or (not argv and sys.stdin.isatty()):
+        print('自选顶点仿真：输入 1 3 5 或 1,3,5；输入 1-10 可选择十个 u。', flush=True)
+        try:
+            args.u = prompt_value('选择 u', ' '.join(map(str, args.u)), parse_positive_values)
+            print(f'已选择 {len(args.u)} 个 u：{args.u}', flush=True)
+            args.m = prompt_value('转移次数 m', ' '.join(map(str, args.m)), parse_positive_values)
+            args.repetitions = prompt_value('独立轨道数 repetitions', args.repetitions, parse_repetitions)
+        except (EOFError, KeyboardInterrupt):
+            parser.exit(0, '\n已取消输入，尚未开始模拟。\n')
+    args.u, args.m = sorted(set(args.u)), sorted(set(args.m))
+    if min(args.u + args.m) < 1 or args.repetitions < 2 or args.seed < 0:
         parser.error('u,m must be positive; repetitions>=2; seed>=0')
+    if args.output is None:
+        args.output = new_output_directory()
+    if args.output.exists() and not args.output.is_dir():
+        parser.error('Output path is a file; choose a directory.')
     # 防止第二次运行不小心覆盖前一次实验。
     if args.output.exists() and any(args.output.iterdir()):
         parser.error('Output directory is not empty; choose a new --output directory.')
+    return args
+
+
+def main(argv=None):
+    args = parse_options(argv)
+    vertices, checkpoints = args.u, args.m
     args.output.mkdir(parents=True, exist_ok=True)
+    print(f'本次运行：{len(vertices)} 个 u = {vertices}；m = {checkpoints}；'
+          f'独立轨道数 = {args.repetitions}；seed = {args.seed}', flush=True)
+    print(f'结果目录：{args.output.resolve()}', flush=True)
     start = time.perf_counter()
     real_seed, proxy_seed = np.random.SeedSequence(args.seed).spawn(2)
     models = {'gauss': simulate_gauss(vertices, checkpoints, args.repetitions,
@@ -209,7 +286,7 @@ def main():
     np.savez_compressed(args.output/'samples.npz', m=np.array(checkpoints),
                         **{f'{name}_u{u}': a for name, data in models.items() for u, a in data.items()})
     code_files = ['simulation.py', 'plotting.py']
-    metadata = dict(seed=args.seed, vertices=vertices, checkpoints=checkpoints,
+    metadata = dict(seed=args.seed, vertices=vertices, vertex_count=len(vertices), checkpoints=checkpoints,
                     repetitions=args.repetitions, python=platform.python_version(),
                     numpy=np.__version__, bit_generator='PCG64',
                     sampler='stationary Gauss natural-extension conditional sampler',

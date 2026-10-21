@@ -1,13 +1,24 @@
 """确定性数学校验 + 固定种子的抽样诊断；不是定理检验。"""
 import math
 from fractions import Fraction
+import io
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
 import unittest
+from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 import numpy as np
 
 from simulation import (LOG2, conditional_labels, digit_probability, edge_probability,
                         edge_tail, empirical_normal_w1, initial_state, next_digit,
-                        outdegrees_from_digits, simulate_gauss)
+                        outdegrees_from_digits, simulate_gauss, summarize,
+                        parse_positive_values, parse_options)
 
 
 def cylinder_probability(word):
@@ -96,6 +107,102 @@ class ModelTests(unittest.TestCase):
         self.assertAlmostEqual(empirical_normal_w1([0]), math.sqrt(2/math.pi), places=12)
         self.assertAlmostEqual(empirical_normal_w1([-2, 0, 1]),
                                empirical_normal_w1([-1, 0, 2]), places=12)
+
+
+class UserInputTests(unittest.TestCase):
+    def test_values_ranges_duplicates_and_invalid_input(self):
+        self.assertEqual(parse_positive_values('1-10'), list(range(1, 11)))
+        self.assertEqual(parse_positive_values('5，1,3 3; 7-9'), [1, 3, 5, 7, 8, 9])
+        for text in ['', '0', '-1', '3-1', '1.5', 'abc', '1-100000000']:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_positive_values(text)
+
+    def test_interactive_retry_and_selected_count(self):
+        with tempfile.TemporaryDirectory() as folder:
+            responses = ['0', '1-10', '30,10,30', '1', '20']
+            with patch('builtins.input', side_effect=responses), patch('sys.stdout', new_callable=io.StringIO):
+                args = parse_options(['--interactive', '--output', folder])
+            self.assertEqual(args.u, list(range(1, 11)))
+            self.assertEqual(args.m, [10, 30])
+            self.assertEqual(args.repetitions, 20)
+
+    def test_no_arguments_prompt_only_in_terminal(self):
+        with patch('sys.stdin.isatty', return_value=True), patch('builtins.input', side_effect=['3', '', '10']), \
+                patch('sys.stdout', new_callable=io.StringIO):
+            args = parse_options([])
+        self.assertEqual(args.u, [3])
+        self.assertEqual(args.repetitions, 10)
+        with patch('sys.stdin.isatty', return_value=False), patch('builtins.input') as input_mock:
+            args = parse_options([])
+        input_mock.assert_not_called()
+        self.assertEqual(args.u, [1, 2, 5])
+        self.assertFalse(args.output.exists())
+        self.assertEqual(args.output.parent, Path(__file__).resolve().parent/'results')
+
+    def test_cli_is_noninteractive_and_existing_results_are_protected(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with patch('builtins.input') as input_mock:
+                args = parse_options(['--u', '9', '2', '9', '--m', '30', '10', '--output', folder])
+            input_mock.assert_not_called()
+            self.assertEqual(args.u, [2, 9])
+            self.assertEqual(args.m, [10, 30])
+            saved = Path(folder)/'existing.txt'
+            saved.write_text('keep', encoding='utf-8')
+            with patch('sys.stderr', new_callable=io.StringIO), self.assertRaises(SystemExit) as error:
+                parse_options(['--output', folder])
+            self.assertEqual(error.exception.code, 2)
+            self.assertEqual(saved.read_text(encoding='utf-8'), 'keep')
+
+
+class ComparisonTests(unittest.TestCase):
+    def test_curves_include_all_vertices_with_individual_normalization(self):
+        from plotting import build_comparison_curves
+        vertices, m = list(range(1, 11)), [10, 30]
+        data = {u: np.array([[0, u, 2*u], [u, 2*u, 3*u]], dtype=float) for u in vertices}
+        samples = {'m': np.array(m), **{f'gauss_u{u}': d for u, d in data.items()}}
+        curves = build_comparison_curves(samples, vertices, 'gauss', summarize(data, 'gauss', m))
+        self.assertEqual([label for label, _ in curves['mean']], [f'u={u}' for u in vertices])
+        self.assertEqual(len(curves['cdf']), 11)
+        for i, u in enumerate(vertices):
+            alpha = math.sqrt(math.pi/(math.log(2)*u*(u+1)))
+            self.assertAlmostEqual(curves['mean_ratio'][i][1][0][1], u/(alpha*math.sqrt(10)))
+            self.assertAlmostEqual(curves['paths'][i][1][1][1], u/(alpha*math.sqrt(30)))
+        proxy_samples = {'m': np.array(m), **{f'poisson_proxy_u{u}': d for u, d in data.items()}}
+        proxy = build_comparison_curves(proxy_samples, vertices, 'poisson_proxy',
+                                       summarize(data, 'poisson_proxy', m))
+        self.assertNotIn('paths', proxy)  # independent proxy checkpoints must not be presented as nested paths
+
+    def test_ten_vertex_interactive_report_end_to_end(self):
+        with tempfile.TemporaryDirectory() as folder:
+            command = [sys.executable, str(Path(__file__).with_name('simulation.py')),
+                       '--interactive', '--output', folder]
+            result = subprocess.run(command, input='1-10\n10 30\n20\n', text=True,
+                                    encoding='utf-8', capture_output=True, timeout=120,
+                                    env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            output = Path(folder)
+            metadata = json.loads((output/'metadata.json').read_text(encoding='utf-8'))
+            self.assertEqual(metadata['vertices'], list(range(1, 11)))
+            self.assertEqual(metadata['vertex_count'], 10)
+            report = (output/'report.html').read_text(encoding='utf-8')
+            for src in re.findall(r'<img src="([^"]+)"', report):
+                self.assertTrue((output/src).is_file(), src)
+            for model in ['gauss', 'poisson_proxy']:
+                svg = ET.parse(output/'figures'/f'compare_{model}_cdf.svg')
+                labels = set(svg.getroot().itertext())
+                for u in range(1, 11):
+                    self.assertIn(f'u={u}', labels)
+                self.assertIn('Standard normal', labels)
+            self.assertGreater(float(svg.getroot().attrib['height']), 460)
+
+    def test_single_vertex_single_checkpoint_report(self):
+        with tempfile.TemporaryDirectory() as folder:
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name('simulation.py')),
+                                     '--u', '3', '--m', '10', '--repetitions', '5', '--skip-proxy',
+                                     '--output', folder], text=True, capture_output=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertTrue((Path(folder)/'figures'/'compare_gauss_mean.svg').is_file())
+            self.assertFalse((Path(folder)/'figures'/'compare_poisson_proxy_cdf.svg').exists())
 
 
 if __name__ == '__main__':
